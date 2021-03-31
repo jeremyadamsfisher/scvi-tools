@@ -30,17 +30,22 @@ class RNADeconv(BaseModuleClass):
         self,
         n_genes: int,
         n_labels: int,
+        n_batches: int,
         **model_kwargs,
     ):
         super().__init__()
         self.n_genes = n_genes
         self.n_labels = n_labels
+        self.n_batches = n_batches
 
         # logit param for negative binomial
         self.px_o = torch.nn.Parameter(torch.randn(self.n_genes))
         self.W = torch.nn.Parameter(
             torch.randn(self.n_genes, self.n_labels)
         )  # n_genes, n_cell types
+
+        # batch rescaling param
+        self.w_dg = torch.nn.Parameter(torch.randn(self.n_batches, 1))
 
         if "ct_weight" in model_kwargs:
             ct_weight = torch.tensor(model_kwargs["ct_prop"], dtype=torch.float32)
@@ -58,7 +63,9 @@ class RNADeconv(BaseModuleClass):
         type
             list of tensor
         """
-        return self.W.cpu().numpy(), self.px_o.cpu().numpy()
+        mu = self.W.cpu().numpy()
+        mu_prime = (mu / self.n_batches) * np.exp(self.w_dg).sum()
+        return mu_prime, self.px_o.cpu().numpy()
 
     def _get_inference_input(self, tensors):
         # we perform MAP here, so there is nothing to infer
@@ -67,8 +74,9 @@ class RNADeconv(BaseModuleClass):
     def _get_generative_input(self, tensors, inference_outputs):
         x = tensors[_CONSTANTS.X_KEY]
         y = tensors[_CONSTANTS.LABELS_KEY]
+        batch = tensors[_CONSTANTS.BATCH_KEY].int()
 
-        input_dict = dict(x=x, y=y)
+        input_dict = dict(x=x, y=y, batch=batch)
         return input_dict
 
     @auto_move_data
@@ -76,13 +84,15 @@ class RNADeconv(BaseModuleClass):
         return {}
 
     @auto_move_data
-    def generative(self, x, y):
-        """Simply build the negative binomial parameters for every cell in the minibatch."""
+    def generative(self, x, y, batch):
+        """Simply build the negative binomial parameters for every cell in the minibatch,
+        rescaling by a per-batch coefficient"""
         px_scale = torch.nn.functional.softplus(self.W)[
             :, y.long()[:, 0]
         ].T  # cells per gene
         library = torch.sum(x, dim=1, keepdim=True)
-        px_rate = library * px_scale
+        w_dng = torch.nn.functional.embedding(batch, weight=self.w_dg)
+        px_rate = library * px_scale * torch.exp(w_dng)
         scaling_factor = self.ct_weight[y.long()[:, 0]]
 
         return dict(
@@ -106,9 +116,13 @@ class RNADeconv(BaseModuleClass):
         scaling_factor = generative_outputs["scaling_factor"]
 
         reconst_loss = -NegativeBinomial(px_rate, logits=px_o).log_prob(x).sum(-1)
-        loss = torch.mean(scaling_factor * reconst_loss)
+        nll_prior = -Normal(
+            torch.zeros_like(self.w_dg),
+            torch.ones_like(self.w_dg)
+        ).log_prob(self.w_dg).sum()
+        loss = torch.mean(scaling_factor * reconst_loss) + nll_prior
 
-        return LossRecorder(loss, reconst_loss, torch.zeros((1,)), 0.0)
+        return LossRecorder(loss, reconst_loss, torch.zeros((1,)), nll_prior)
 
     @torch.no_grad()
     def sample(
