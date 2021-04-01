@@ -64,7 +64,8 @@ class RNADeconv(BaseModuleClass):
             list of tensor
         """
         mu = self.W.cpu().numpy()
-        mu_prime = (mu / self.n_batches) * np.exp(self.w_dg).sum()
+        w_dg = self.w_dg.cpu().numpy()
+        mu_prime = (mu / self.n_batches) * np.exp(w_dg).sum()
         return mu_prime, self.px_o.cpu().numpy()
 
     def _get_inference_input(self, tensors):
